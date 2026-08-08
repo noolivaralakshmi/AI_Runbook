@@ -56,7 +56,7 @@ def login():
     Authenticate user credentials.
 
     BUG: This endpoint has an intentional bug - it queries a non-existent
-    table 'user_credentials' instead of 'users', causing a 500 error.
+    table 'users' instead of 'users', causing a 500 error.
     """
     data = request.get_json()
     username = data.get("username")
@@ -67,9 +67,9 @@ def login():
 
     try:
         db = get_db()
-        # BUG: Wrong table name! Should be 'users' not 'user_credentials'
+        # BUG: Wrong table name! Should be 'users' not 'users'
         user = db.execute(
-            "SELECT * FROM user_credentials WHERE username = ? AND password = ?",
+            "SELECT * FROM users WHERE username = ? AND password = ?",
             (username, password)
         ).fetchone()
         db.close()
@@ -85,7 +85,7 @@ def login():
         return jsonify({
             "error": "Internal Server Error",
             "message": str(e),
-            "trace": "File 'app.py', line 62, in login: sqlite3.OperationalError: no such table: user_credentials"
+            "trace": "File 'app.py', line 62, in login: sqlite3.OperationalError: no such table: users"
         }), 500
 
 
