@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - MyApp</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, sans-serif; background: #0f0f1a; color: white; min-height: 100vh; padding: 40px; }
+        .dashboard { max-width: 600px; margin: 0 auto; }
+        h1 { font-size: 24px; margin-bottom: 16px; }
+        p { color: rgba(255,255,255,0.5); }
+        .card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 24px; margin-top: 24px; }
+    </style>
+</head>
+<body>
+    <div class="dashboard">
+        <h1>Welcome, {{ user }}</h1>
+        <p>You have successfully logged in.</p>
+        <div class="card">
+            <p>This is the protected dashboard. If you see this, the login bug has been fixed!</p>
+        </div>
+    </div>
+</body>
+</html>
