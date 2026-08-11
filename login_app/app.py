@@ -71,7 +71,7 @@ def login():
         user = db.execute(
             "SELECT * FROM users WHERE username = ? AND password = ?",
             (username, password)
-        ).fetchone()
+        user = cursor.fetchone()
         db.close()
 
         if user:
