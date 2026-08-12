@@ -69,7 +69,7 @@ def login():
         db = get_db()
         # BUG: Wrong table name! Should be 'users' not 'users'
         user = db.execute(
-            "SELECT * FROM users WHERE username = ? AND password = ?",
+            SELECT * FROM users WHERE username = ?
             (username, password)
         ).fetchone()
         db.close()
