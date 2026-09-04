@@ -1,0 +1,390 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Runbook Demo - EC2 instance with login app, CloudWatch alarms, SNS → Discord Lambda'
+
+Parameters:
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access
+  DiscordWebhookUrl:
+    Type: String
+    Description: Discord Webhook URL for posting alarm notifications
+    NoEcho: true
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type (t3.micro is free tier eligible)
+
+Resources:
+
+  # ─── Security Group ───
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP and SSH
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: runbook-demo-sg
+
+  # ─── IAM Role for EC2 (CloudWatch Agent) ───
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: runbook-demo-ec2-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # ─── EC2 Instance ───
+  WebServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !GetAtt WebSecurityGroup.GroupId
+      ImageId: ami-0bdc7d025135d7b49  # Amazon Linux 2023 (us-east-1)
+      Tags:
+        - Key: Name
+          Value: runbook-demo-server
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+
+          # Update system
+          yum update -y
+          yum install -y python3 python3-pip git
+
+          # Install CloudWatch Agent
+          yum install -y amazon-cloudwatch-agent
+
+          # Create app directory
+          mkdir -p /opt/login-app
+          cd /opt/login-app
+
+          # Clone the app from GitHub
+          git clone https://github.com/noolivaralakshmi/AI_Runbook.git repo
+          cp -r repo/login_app/* .
+
+          # Install dependencies
+          pip3 install flask gunicorn
+
+          # Create systemd service
+          cat > /etc/systemd/system/login-app.service << 'EOF'
+          [Unit]
+          Description=Login App Demo
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=root
+          WorkingDirectory=/opt/login-app
+          ExecStart=/usr/local/bin/gunicorn -w 2 -b 0.0.0.0:3000 app:app
+          Restart=always
+          RestartSec=5
+          Environment=FLASK_ENV=production
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          # Start the app
+          systemctl daemon-reload
+          systemctl enable login-app
+          systemctl start login-app
+
+          # Configure CloudWatch Agent for app logs
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
+          {
+            "agent": {
+              "metrics_collection_interval": 60
+            },
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/var/log/messages",
+                      "log_group_name": "/runbook-demo/app-logs",
+                      "log_stream_name": "{instance_id}/app",
+                      "retention_in_days": 7
+                    }
+                  ]
+                }
+              }
+            },
+            "metrics": {
+              "namespace": "RunbookDemo",
+              "metrics_collected": {
+                "cpu": {
+                  "measurement": ["cpu_usage_idle", "cpu_usage_user", "cpu_usage_system"],
+                  "metrics_collection_interval": 60
+                },
+                "disk": {
+                  "measurement": ["used_percent"],
+                  "metrics_collection_interval": 60,
+                  "resources": ["/"]
+                },
+                "mem": {
+                  "measurement": ["mem_used_percent"],
+                  "metrics_collection_interval": 60
+                }
+              }
+            }
+          }
+          EOF
+
+          # Start CloudWatch Agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config \
+            -m ec2 \
+            -s \
+            -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+  # ─── SNS Topic for Alarms ───
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: runbook-demo-alarms
+
+  # ─── Lambda Execution Role ───
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: runbook-demo-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # ─── Lambda Function (SNS → Discord) ───
+  DiscordNotifierFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: runbook-discord-notifier
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          DISCORD_WEBHOOK_URL: !Ref DiscordWebhookUrl
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import urllib.request
+
+          DISCORD_WEBHOOK_URL = os.environ['DISCORD_WEBHOOK_URL']
+
+          def handler(event, context):
+              """Receive SNS alarm notification and post to Discord as !incident command."""
+              for record in event.get('Records', []):
+                  message = record['Sns']['Message']
+
+                  try:
+                      alarm = json.loads(message)
+                  except json.JSONDecodeError:
+                      alarm = {"AlarmName": "Unknown", "NewStateReason": message}
+
+                  alarm_name = alarm.get('AlarmName', 'Unknown Alarm')
+                  reason = alarm.get('NewStateReason', 'No details')
+                  state = alarm.get('NewStateValue', 'ALARM')
+                  region = alarm.get('Region', 'us-east-1')
+                  timestamp = alarm.get('StateChangeTime', '')
+                  namespace = alarm.get('Trigger', {}).get('Namespace', '')
+                  metric = alarm.get('Trigger', {}).get('MetricName', '')
+                  instance_id = ''
+
+                  # Extract instance ID from dimensions
+                  dimensions = alarm.get('Trigger', {}).get('Dimensions', [])
+                  for dim in dimensions:
+                      if dim.get('name') == 'InstanceId':
+                          instance_id = dim.get('value', '')
+
+                  # Only post for ALARM state (not OK)
+                  if state != 'ALARM':
+                      print(f"Skipping non-alarm state: {state}")
+                      return {'statusCode': 200, 'body': 'Skipped (not ALARM state)'}
+
+                  # Format as incident report for the bot
+                  incident_desc = (
+                      f"!incident CloudWatch ALARM: {alarm_name} | "
+                      f"Metric: {metric} | "
+                      f"Instance: {instance_id} | "
+                      f"Region: {region} | "
+                      f"Reason: {reason}"
+                  )
+
+                  # Post to Discord
+                  payload = json.dumps({"content": incident_desc}).encode('utf-8')
+                  req = urllib.request.Request(
+                      DISCORD_WEBHOOK_URL,
+                      data=payload,
+                      headers={'Content-Type': 'application/json'},
+                      method='POST'
+                  )
+                  urllib.request.urlopen(req)
+                  print(f"Posted alarm to Discord: {alarm_name}")
+
+              return {'statusCode': 200, 'body': 'Alarm posted to Discord'}
+
+  # ─── SNS → Lambda Permission ───
+  LambdaSNSPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DiscordNotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AlarmTopic
+
+  # ─── SNS Subscription ───
+  LambdaSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: lambda
+      Endpoint: !GetAtt DiscordNotifierFunction.Arn
+
+  # ─── CloudWatch Alarms ───
+
+  # Alarm 1: EC2 Instance Status Check Failed
+  InstanceStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: runbook-demo-instance-down
+      AlarmDescription: EC2 instance failed status check (server down)
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref WebServer
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  # Alarm 2: High CPU Utilization (>80%)
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: runbook-demo-high-cpu
+      AlarmDescription: CPU utilization exceeded 80% for 5 minutes
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref WebServer
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  # Alarm 3: High Disk Usage (>85%)
+  HighDiskAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: runbook-demo-disk-full
+      AlarmDescription: Disk usage exceeded 85% on root volume
+      Namespace: RunbookDemo
+      MetricName: disk_used_percent
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref WebServer
+        - Name: path
+          Value: /
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  # Alarm 4: Application 500 errors (via log metric filter)
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /runbook-demo/app-logs
+      RetentionInDays: 7
+
+  Error500MetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref AppLogGroup
+      FilterPattern: '"500 Internal Server Error" OR "OperationalError" OR "Traceback"'
+      MetricTransformations:
+        - MetricName: App500Errors
+          MetricNamespace: RunbookDemo
+          MetricValue: '1'
+          DefaultValue: 0
+
+  App500ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: runbook-demo-500-errors
+      AlarmDescription: Application is throwing 500 Internal Server Errors
+      Namespace: RunbookDemo
+      MetricName: App500Errors
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlarmTopic
+
+Outputs:
+  InstancePublicIP:
+    Description: Public IP of the demo EC2 instance
+    Value: !GetAtt WebServer.PublicIp
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref WebServer
+  LoginAppURL:
+    Description: URL for the login app
+    Value: !Sub 'http://${WebServer.PublicIp}:3000'
+  SNSTopicArn:
+    Description: SNS Topic ARN for alarms
+    Value: !Ref AlarmTopic
+  LambdaFunctionName:
+    Description: Lambda function name
+    Value: !Ref DiscordNotifierFunction
